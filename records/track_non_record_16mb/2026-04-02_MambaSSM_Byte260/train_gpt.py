@@ -65,7 +65,7 @@ class Hyperparameters:
     # Model shape — Mamba-3
     vocab_size = int(os.environ.get("VOCAB_SIZE", 260))
     num_layers = int(os.environ.get("NUM_LAYERS", 10))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 896))
     expand = int(os.environ.get("EXPAND", 2))  # d_inner = expand * model_dim
     headdim = int(os.environ.get("HEADDIM", 64))
     d_state = int(os.environ.get("D_STATE", 64))
@@ -525,8 +525,8 @@ class Mamba3BlockWrapper(nn.Module):
         self.beta = 8.0 * num_layers ** -0.25
 
     @torch.compiler.disable
-    def forward(self, x: Tensor, mlp: MLP, cu_seqlens: Tensor | None = None) -> Tensor:
-        x = self.ssm_postnorm(self.alpha * x + self.beta * self.mamba3(x, cu_seqlens=cu_seqlens))
+    def forward(self, x: Tensor, mlp: MLP) -> Tensor:
+        x = self.ssm_postnorm(self.alpha * x + self.beta * self.mamba3(x))
         x = self.mlp_postnorm(self.alpha * x + self.beta * mlp(x))
         return x
 
@@ -580,31 +580,11 @@ class MambaModel(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
 
-    @staticmethod
-    def _build_cu_seqlens(input_ids: Tensor) -> Tensor:
-        """Build cu_seqlens from BOS (token id 1) positions for sequence packing."""
-        B, T = input_ids.shape
-        flat = input_ids.reshape(-1)                          # (B*T,)
-        bos_mask = flat == 1                                  # BOS token id
-        bos_positions = torch.where(bos_mask)[0]              # absolute offsets
-        # cu_seqlens: starts at 0, each BOS starts a new doc, ends at B*T
-        cu_seqlens = torch.cat([
-            bos_positions,
-            flat.new_tensor([B * T]),
-        ]).to(dtype=torch.int32)
-        # Ensure starts with 0 (first token should be BOS, but be safe)
-        if cu_seqlens[0] != 0:
-            cu_seqlens = torch.cat([flat.new_tensor([0], dtype=torch.int32), cu_seqlens])
-        return cu_seqlens
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        B, T = input_ids.shape
-        # Mamba3 kernel requires batch=1 with cu_seqlens; flatten to (1, B*T)
-        cu_seqlens = self._build_cu_seqlens(input_ids)
-        x = self.tok_emb(input_ids.reshape(1, -1))
+        x = self.tok_emb(input_ids)
 
         for block in self.blocks:
-            x = block(x, self.shared_mlp, cu_seqlens=cu_seqlens)
+            x = block(x, self.shared_mlp)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
