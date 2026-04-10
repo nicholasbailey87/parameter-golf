@@ -64,7 +64,7 @@ class Hyperparameters:
 
     # Model shape — Mamba-3
     vocab_size = int(os.environ.get("VOCAB_SIZE", 260))
-    num_layers = int(os.environ.get("NUM_LAYERS", 12))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     expand = int(os.environ.get("EXPAND", 2))  # d_inner = expand * model_dim
     headdim = int(os.environ.get("HEADDIM", 64))
@@ -72,6 +72,7 @@ class Hyperparameters:
     ngroups = int(os.environ.get("NGROUPS", 1))
     chunk_size = int(os.environ.get("CHUNK_SIZE", 64))
     rope_fraction = float(os.environ.get("ROPE_FRACTION", 0.5))
+    mlp_hidden = int(os.environ.get("MLP_HIDDEN", 1408))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -491,24 +492,43 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+class MLP(nn.Module):
+    """Shared MLP: linear → squared ReLU → rmsnorm → linear → rmsnorm."""
+
+    def __init__(self, d_model: int, hidden: int):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, hidden, bias=False)
+        self.norm1 = RMSNorm()
+        self.fc2 = nn.Linear(hidden, d_model, bias=False)
+        self.norm2 = RMSNorm()
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.norm2(self.fc2(self.norm1(F.relu(self.fc1(x)).square())))
+
+
 class Mamba3BlockWrapper(nn.Module):
-    """Pre-norm + residual wrapper around official Mamba3 module."""
+    """Post-norm residual wrapper: SSM + shared MLP with DeepNorm-style scaling."""
 
     def __init__(self, d_model: int, d_state: int, expand: int, headdim: int,
                  ngroups: int, chunk_size: int, layer_idx: int, n_layer: int,
-                 rope_fraction: float = 0.5):
+                 rope_fraction: float, num_layers: int):
         super().__init__()
-        self.norm = RMSNorm()
         self.mamba3 = Mamba3(
             d_model=d_model, d_state=d_state, expand=expand,
             headdim=headdim, ngroups=ngroups, chunk_size=chunk_size,
             rope_fraction=rope_fraction, is_mimo=False,
             is_outproj_norm=False, layer_idx=layer_idx, n_layer=n_layer,
         )
+        self.ssm_postnorm = RMSNorm()
+        self.mlp_postnorm = RMSNorm()
+        self.alpha = 2.0 * num_layers ** 0.25
+        self.beta = 8.0 * num_layers ** -0.25
 
     @torch.compiler.disable
-    def forward(self, x: Tensor) -> Tensor:
-        return x + self.mamba3(self.norm(x))
+    def forward(self, x: Tensor, mlp: MLP, cu_seqlens: Tensor | None = None) -> Tensor:
+        x = self.ssm_postnorm(self.alpha * x + self.beta * self.mamba3(x, cu_seqlens=cu_seqlens))
+        x = self.mlp_postnorm(self.alpha * x + self.beta * mlp(x))
+        return x
 
 
 class MambaModel(nn.Module):
@@ -525,6 +545,7 @@ class MambaModel(nn.Module):
         ngroups: int,
         chunk_size: int,
         rope_fraction: float,
+        mlp_hidden: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -538,11 +559,12 @@ class MambaModel(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, d_model)
 
+        self.shared_mlp = MLP(d_model, mlp_hidden)
         self.blocks = nn.ModuleList([
             Mamba3BlockWrapper(
                 d_model=d_model, d_state=d_state, expand=expand, headdim=headdim,
                 ngroups=ngroups, chunk_size=chunk_size, layer_idx=i, n_layer=num_layers,
-                rope_fraction=rope_fraction,
+                rope_fraction=rope_fraction, num_layers=num_layers,
             )
             for i in range(num_layers)
         ])
@@ -558,12 +580,29 @@ class MambaModel(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
 
+    @staticmethod
+    def _build_cu_seqlens(input_ids: Tensor) -> Tensor:
+        """Build cu_seqlens from BOS (token id 1) positions for sequence packing."""
+        B, T = input_ids.shape
+        flat = input_ids.reshape(-1)                          # (B*T,)
+        bos_mask = flat == 1                                  # BOS token id
+        bos_positions = torch.where(bos_mask)[0]              # absolute offsets
+        # cu_seqlens: starts at 0, each BOS starts a new doc, ends at B*T
+        cu_seqlens = torch.cat([
+            bos_positions,
+            flat.new_tensor([B * T]),
+        ]).to(dtype=torch.int32)
+        # Ensure starts with 0 (first token should be BOS, but be safe)
+        if cu_seqlens[0] != 0:
+            cu_seqlens = torch.cat([flat.new_tensor([0], dtype=torch.int32), cu_seqlens])
+        return cu_seqlens
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        cu_seqlens = self._build_cu_seqlens(input_ids)
         x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
 
         for block in self.blocks:
-            x = block(x)
+            x = block(x, self.shared_mlp, cu_seqlens=cu_seqlens)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -698,6 +737,7 @@ def main() -> None:
         ngroups=args.ngroups,
         chunk_size=args.chunk_size,
         rope_fraction=args.rope_fraction,
+        mlp_hidden=args.mlp_hidden,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
