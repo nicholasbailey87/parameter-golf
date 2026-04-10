@@ -598,8 +598,10 @@ class MambaModel(nn.Module):
         return cu_seqlens
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        B, T = input_ids.shape
+        # Mamba3 kernel requires batch=1 with cu_seqlens; flatten to (1, B*T)
         cu_seqlens = self._build_cu_seqlens(input_ids)
-        x = self.tok_emb(input_ids)
+        x = self.tok_emb(input_ids.reshape(1, -1))
 
         for block in self.blocks:
             x = block(x, self.shared_mlp, cu_seqlens=cu_seqlens)
