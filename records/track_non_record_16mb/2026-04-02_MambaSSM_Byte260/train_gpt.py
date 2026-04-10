@@ -65,7 +65,7 @@ class Hyperparameters:
     # Model shape — Mamba-3
     vocab_size = int(os.environ.get("VOCAB_SIZE", 260))
     num_layers = int(os.environ.get("NUM_LAYERS", 10))
-    model_dim = int(os.environ.get("MODEL_DIM", 896))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
     expand = int(os.environ.get("EXPAND", 2))  # d_inner = expand * model_dim
     headdim = int(os.environ.get("HEADDIM", 64))
     d_state = int(os.environ.get("D_STATE", 64))
