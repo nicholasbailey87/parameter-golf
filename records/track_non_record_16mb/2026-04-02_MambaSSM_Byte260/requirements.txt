@@ -1,2 +1,5 @@
 torch>=2.4.0
 numpy
+einops
+mamba-ssm
+flash-attn>=2.8.0

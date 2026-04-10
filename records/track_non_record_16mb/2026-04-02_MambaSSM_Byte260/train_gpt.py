@@ -1,11 +1,11 @@
 """
-Modified Mamba SSM + Byte-Level Tokenization for Parameter Golf.
+Mamba-3 + Byte-Level Tokenization for Parameter Golf.
 
-Architecture: Mamba blocks with the "Achilles' Heel" fix (residual bypass around Conv1d
-+ positional encoding), byte-level tokenization (vocab=260), U-Net skip connections.
+Architecture: Official Mamba-3 blocks (with RoPE, Triton SSD kernel, gated B/C norms),
+byte-level tokenization (vocab=260), flash-attn fused cross-entropy.
 
 Based on:
-- "Achilles' Heel of Mamba" (NeurIPS 2025 Spotlight): https://arxiv.org/abs/2509.17514
+- state-spaces/mamba (Mamba-3 module with Triton kernels)
 - Parameter Golf baseline train_gpt.py infrastructure
 """
 
@@ -36,6 +36,9 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from mamba_ssm.modules.mamba3 import Mamba3
+from flash_attn.losses.cross_entropy import CrossEntropyLoss as FlashCrossEntropyLoss
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -59,16 +62,16 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
-    # Model shape — Mamba-2 / SSD
+    # Model shape — Mamba-3
     vocab_size = int(os.environ.get("VOCAB_SIZE", 260))
     num_layers = int(os.environ.get("NUM_LAYERS", 12))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     expand = int(os.environ.get("EXPAND", 2))  # d_inner = expand * model_dim
     headdim = int(os.environ.get("HEADDIM", 64))
     d_state = int(os.environ.get("D_STATE", 64))
-    d_conv = int(os.environ.get("D_CONV", 4))
     ngroups = int(os.environ.get("NGROUPS", 1))
     chunk_size = int(os.environ.get("CHUNK_SIZE", 64))
+    rope_fraction = float(os.environ.get("ROPE_FRACTION", 0.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -288,7 +291,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "block_scale,skip_weight,skip_weights,conv_residual_alpha,A_log,dt_bias,.D,out_norm",
+        "dt_bias,.D,B_bias,C_bias,B_norm,C_norm",
     ).split(",")
     if pattern
 )
@@ -488,233 +491,28 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
-class CastedLinear(nn.Linear):
-    def forward(self, x: Tensor) -> Tensor:
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+class Mamba3BlockWrapper(nn.Module):
+    """Pre-norm + residual wrapper around official Mamba3 module."""
 
-
-def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    with torch.no_grad():
-        for name, param in module.named_parameters():
-            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
-                param.data = param.data.float()
-
-
-def segsum(x: Tensor) -> Tensor:
-    """Stable segment sum for computing causal decay matrices (from Mamba-2 SSD paper)."""
-    T = x.size(-1)
-    x = x.unsqueeze(-1).expand(*x.shape, T)
-    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=-1)
-    x = x.masked_fill(~mask, 0)
-    x_segsum = torch.cumsum(x, dim=-2)
-    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=0)
-    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
-    return x_segsum
-
-
-@torch.compiler.disable
-def ssd_scan(
-    x: Tensor, dt: Tensor, A: Tensor, B: Tensor, C: Tensor,
-    chunk_size: int, D: Tensor | None = None,
-) -> Tensor:
-    """Pure-PyTorch SSD scan from Mamba-2 (no Triton).
-
-    Args:
-        x: (batch, length, nheads, headdim)
-        dt: (batch, length, nheads) — timestep (after softplus)
-        A: (nheads,) — negative log decay
-        B: (batch, length, ngroups, d_state)
-        C: (batch, length, ngroups, d_state)
-        chunk_size: block size for chunked computation
-        D: (nheads,) — skip connection, optional
-
-    Returns:
-        Y: (batch, length, nheads, headdim)
-    """
-    batch, seqlen, nheads, headdim = x.shape
-
-    # Pad sequence to multiple of chunk_size
-    pad = (chunk_size - seqlen % chunk_size) % chunk_size
-    if pad > 0:
-        x = F.pad(x, (0, 0, 0, 0, 0, pad))
-        dt = F.pad(dt, (0, 0, 0, pad))
-        B = F.pad(B, (0, 0, 0, 0, 0, pad))
-        C = F.pad(C, (0, 0, 0, 0, 0, pad))
-
-    # Merge dt into x and A: x_scaled = x * dt, A_scaled = A * dt
-    x_for_D = x  # save unscaled for D skip
-    x = x * dt.unsqueeze(-1)  # (B, L_pad, H, P)
-    A_dt = (A * dt)  # (B, L_pad, H)
-
-    # Reshape into chunks: (B, nchunks, chunk_size, ...)
-    L_pad = x.shape[1]
-    nchunks = L_pad // chunk_size
-    x = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
-    A_dt = A_dt.transpose(1, 2)  # (B, H, L_pad)
-    A_dt = A_dt.reshape(batch, nheads, nchunks, chunk_size)
-    B = B.reshape(batch, nchunks, chunk_size, -1, B.shape[-1])  # (B, nc, cs, G, N)
-    C = C.reshape(batch, nchunks, chunk_size, -1, C.shape[-1])
-
-    A_cumsum = torch.cumsum(A_dt, dim=-1)  # (B, H, nc, cs)
-
-    # 1. Intra-chunk (diagonal blocks)
-    L_matrix = torch.exp(segsum(A_dt))  # (B, H, nc, cs, cs) — causal decay
-    Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L_matrix, x)
-
-    # 2. Chunk boundary states
-    decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)  # (B, H, nc, cs)
-    states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, x)
-
-    # 3. Inter-chunk recurrence (parallel via segsum)
-    initial_states = torch.zeros_like(states[:, :1])
-    states = torch.cat([initial_states, states], dim=1)
-    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
-    new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
-    states = new_states[:, :-1]
-
-    # 4. State -> output (off-diagonal blocks)
-    state_decay_out = torch.exp(A_cumsum)  # (B, H, nc, cs)
-    Y_off = torch.einsum("bclhn,bchpn,bhcl->bclhp", C, states, state_decay_out)
-
-    # Combine
-    Y = Y_diag + Y_off  # (B, nc, cs, H, P)
-    Y = Y.reshape(batch, -1, nheads, headdim)  # (B, L_pad, H, P)
-
-    # D skip connection
-    if D is not None:
-        Y = Y + x_for_D.reshape(batch, -1, nheads, headdim) * D[None, None, :, None]
-
-    # Remove padding
-    return Y[:, :seqlen]
-
-
-class RMSNormGated(nn.Module):
-    """RMSNorm with a gating branch, as used in Mamba-2 output."""
-    def __init__(self, d: int, eps: float = 1e-5):
+    def __init__(self, d_model: int, d_state: int, expand: int, headdim: int,
+                 ngroups: int, chunk_size: int, layer_idx: int, n_layer: int,
+                 rope_fraction: float = 0.5):
         super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d))
-
-    def forward(self, x: Tensor, z: Tensor) -> Tensor:
-        # Gate first, then normalize
-        x = x * F.silu(z)
-        return F.rms_norm(x, (x.size(-1),), self.weight.to(dtype=x.dtype), eps=self.eps)
-
-
-class Mamba2Block(nn.Module):
-    """Mamba-2 / SSD block with the Achilles' Heel fix (residual bypass around conv1d)."""
-
-    def __init__(
-        self, d_model: int, d_inner: int, headdim: int, d_state: int,
-        d_conv: int, ngroups: int, chunk_size: int, layer_idx: int,
-    ):
-        super().__init__()
-        self.d_model = d_model
-        self.d_inner = d_inner
-        self.headdim = headdim
-        self.nheads = d_inner // headdim
-        self.d_state = d_state
-        self.ngroups = ngroups
-        self.d_conv = d_conv
-        self.chunk_size = chunk_size
-
         self.norm = RMSNorm()
-
-        # Mamba-2 projects z, xBC, dt all at once
-        conv_dim = d_inner + 2 * ngroups * d_state
-        d_in_proj = 2 * d_inner + 2 * ngroups * d_state + self.nheads
-        self.in_proj = CastedLinear(d_model, d_in_proj, bias=False)
-
-        # Depthwise causal conv1d on (x, B, C) concatenated
-        self.conv1d = nn.Conv1d(
-            in_channels=conv_dim,
-            out_channels=conv_dim,
-            kernel_size=d_conv,
-            padding=d_conv - 1,
-            groups=conv_dim,
-            bias=True,
+        self.mamba3 = Mamba3(
+            d_model=d_model, d_state=d_state, expand=expand,
+            headdim=headdim, ngroups=ngroups, chunk_size=chunk_size,
+            rope_fraction=rope_fraction, is_mimo=False,
+            is_outproj_norm=False, layer_idx=layer_idx, n_layer=n_layer,
         )
 
-        # dt bias: per-head, initialized so softplus(dt_bias) in [dt_min, dt_max]
-        dt_min, dt_max = 0.001, 0.1
-        dt = torch.exp(
-            torch.rand(self.nheads) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
-        ).clamp(min=1e-4)
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        self.dt_bias = nn.Parameter(inv_dt)
-
-        # A: per-head, initialized in range [1, 16]
-        A = torch.empty(self.nheads, dtype=torch.float32).uniform_(1, 16)
-        self.A_log = nn.Parameter(torch.log(A))
-
-        # D: per-head skip
-        self.D = nn.Parameter(torch.ones(self.nheads))
-
-        # Gated RMSNorm before output projection (Mamba-2 style)
-        self.out_norm = RMSNormGated(d_inner)
-
-        # Output projection
-        self.out_proj = CastedLinear(d_inner, d_model, bias=False)
-        self.out_proj._zero_init = True
-
-        # Achilles' Heel fix: learnable residual bypass around conv1d for x portion
-        self.conv_residual_alpha = nn.Parameter(torch.tensor(0.1))
-
-        # Block output scaling
-        self.block_scale = nn.Parameter(torch.ones(d_model, dtype=torch.float32))
-
+    @torch.compiler.disable
     def forward(self, x: Tensor) -> Tensor:
-        residual = x
-        x = self.norm(x)
-        batch, seqlen, _ = x.shape
-
-        # Project to [z, xBC, dt]
-        zxbcdt = self.in_proj(x)  # (B, L, d_in_proj)
-        z, xBC, dt = zxbcdt.split(
-            [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads],
-            dim=-1,
-        )
-
-        # Save x portion of xBC before conv (for Achilles' Heel residual bypass)
-        x_raw = xBC[:, :, :self.d_inner]
-
-        # Causal conv1d on xBC
-        xBC_conv = self.conv1d(xBC.transpose(1, 2))[..., :seqlen].transpose(1, 2)
-        xBC_conv = F.silu(xBC_conv)
-
-        # Achilles' Heel fix: bypass conv for x portion
-        alpha = self.conv_residual_alpha.to(dtype=xBC_conv.dtype)
-        xBC_conv[:, :, :self.d_inner] = xBC_conv[:, :, :self.d_inner] + alpha * x_raw
-
-        # Split into x, B, C
-        x_ssm, B, C = xBC_conv.split(
-            [self.d_inner, self.ngroups * self.d_state, self.ngroups * self.d_state],
-            dim=-1,
-        )
-
-        # Reshape for multi-head SSD
-        x_ssm = x_ssm.reshape(batch, seqlen, self.nheads, self.headdim)
-        B = B.reshape(batch, seqlen, self.ngroups, self.d_state)
-        C = C.reshape(batch, seqlen, self.ngroups, self.d_state)
-
-        # dt: softplus with per-head bias
-        dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
-
-        # SSD scan
-        A = -torch.exp(self.A_log.float())  # (nheads,) — negative
-        y = ssd_scan(x_ssm, dt, A, B, C, self.chunk_size, D=self.D)  # (B, L, H, P)
-        y = y.reshape(batch, seqlen, self.d_inner)
-
-        # Gated RMSNorm + output projection
-        y = self.out_norm(y, z)
-        out = self.out_proj(y)
-
-        return residual + self.block_scale.to(dtype=out.dtype)[None, None, :] * out
+        return x + self.mamba3(self.norm(x))
 
 
 class MambaModel(nn.Module):
-    """Mamba-2 language model with U-Net skip connections."""
+    """Mamba-3 language model with Triton SSD kernels."""
 
     def __init__(
         self,
@@ -724,9 +522,9 @@ class MambaModel(nn.Module):
         expand: int,
         headdim: int,
         d_state: int,
-        d_conv: int,
         ngroups: int,
         chunk_size: int,
+        rope_fraction: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -734,61 +532,51 @@ class MambaModel(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        d_inner = expand * d_model
 
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, d_model)
 
-        # U-Net skip connections
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, d_model, dtype=torch.float32))
-
         self.blocks = nn.ModuleList([
-            Mamba2Block(d_model, d_inner, headdim, d_state, d_conv, ngroups, chunk_size, layer_idx=i)
+            Mamba3BlockWrapper(
+                d_model=d_model, d_state=d_state, expand=expand, headdim=headdim,
+                ngroups=ngroups, chunk_size=chunk_size, layer_idx=i, n_layer=num_layers,
+                rope_fraction=rope_fraction,
+            )
             for i in range(num_layers)
         ])
 
         self.final_norm = RMSNorm()
-        self.lm_head = None if tie_embeddings else CastedLinear(d_model, vocab_size, bias=False)
+        self.lm_head = None if tie_embeddings else nn.Linear(d_model, vocab_size, bias=False)
         if self.lm_head is not None:
-            self.lm_head._zero_init = True
+            nn.init.zeros_(self.lm_head.weight)
+        self.ce_loss = FlashCrossEntropyLoss(reduction="mean")
         self._init_weights()
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        skips: list[Tensor] = []
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x)
-            skips.append(x)
-
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x)
+        for block in self.blocks:
+            x = block(x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return self._ce_forward(logits.float(), targets)
+
+    @torch.compiler.disable
+    def _ce_forward(self, logits: Tensor, targets: Tensor) -> Tensor:
+        return self.ce_loss(logits, targets)
 
 
 # -----------------------------
@@ -907,28 +695,24 @@ def main() -> None:
         expand=args.expand,
         headdim=args.headdim,
         d_state=args.d_state,
-        d_conv=args.d_conv,
         ngroups=args.ngroups,
         chunk_size=args.chunk_size,
+        rope_fraction=args.rope_fraction,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
     ).to(device).bfloat16()
-    for module in base_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
-    restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses TIED_EMBED_LR
     # - matrix params in blocks (2D, not control) use MATRIX_LR via Muon
-    # - SSM dynamics params (A_log, D_param, dt_proj bias) use SSM_LR via Adam
+    # - SSM dynamics params (dt_bias, D, B_bias, C_bias) use SSM_LR via Adam
     # - other vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
 
-    ssm_param_patterns = ("A_log", "dt_bias", ".D")
+    ssm_param_patterns = ("dt_bias", ".D", "B_bias", "C_bias")
     matrix_params = [
         p for name, p in block_named_params
         if p.ndim == 2
@@ -944,8 +728,6 @@ def main() -> None:
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         and not any(pattern in name for pattern in ssm_param_patterns)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -986,9 +768,9 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"architecture:mamba2_ssd d_model:{args.model_dim} d_inner:{args.expand * args.model_dim} "
+    log0(f"architecture:mamba3_siso d_model:{args.model_dim} d_inner:{args.expand * args.model_dim} "
          f"headdim:{args.headdim} d_state:{args.d_state} ngroups:{args.ngroups} "
-         f"d_conv:{args.d_conv} chunk_size:{args.chunk_size} num_layers:{args.num_layers}")
+         f"chunk_size:{args.chunk_size} num_layers:{args.num_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
