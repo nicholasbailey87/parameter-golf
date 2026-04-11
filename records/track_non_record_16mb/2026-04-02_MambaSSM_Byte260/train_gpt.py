@@ -64,7 +64,7 @@ class Hyperparameters:
 
     # Model shape — Mamba-3
     vocab_size = int(os.environ.get("VOCAB_SIZE", 260))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_layers = int(os.environ.get("NUM_LAYERS", 12))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     expand = int(os.environ.get("EXPAND", 2))  # d_inner = expand * model_dim
     headdim = int(os.environ.get("HEADDIM", 64))
@@ -72,7 +72,7 @@ class Hyperparameters:
     ngroups = int(os.environ.get("NGROUPS", 1))
     chunk_size = int(os.environ.get("CHUNK_SIZE", 64))
     rope_fraction = float(os.environ.get("ROPE_FRACTION", 0.5))
-    mlp_hidden = int(os.environ.get("MLP_HIDDEN", 1408))
+    mlp_hidden = int(os.environ.get("MLP_HIDDEN", 1024))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -114,10 +114,12 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int,
+                 nesterov: bool = True, weight_decay: float = 0.0):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps,
+                 nesterov=nesterov, weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -162,10 +164,13 @@ class Muon(torch.optim.Optimizer):
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
+            wd = group["weight_decay"]
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
+                if wd > 0:
+                    p.mul_(1 - lr * wd)
                 curr += p.numel()
 
         return loss
@@ -484,26 +489,29 @@ class DistributedTokenLoader:
 # -----------------------------
 
 class RMSNorm(nn.Module):
-    def __init__(self, eps: float | None = None):
+    def __init__(self, d_model: int, eps: float = 1e-5):
         super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+        return F.rms_norm(x, self.weight.shape, self.weight, self.eps)
 
 
 class MLP(nn.Module):
-    """Shared MLP: linear → squared ReLU → rmsnorm → linear → rmsnorm."""
+    """SwiGLU MLP with internal norms: fc1 → split → SiLU gate * value → norm1 → fc2 → norm2."""
 
     def __init__(self, d_model: int, hidden: int):
         super().__init__()
-        self.fc1 = nn.Linear(d_model, hidden, bias=False)
-        self.norm1 = RMSNorm()
+        self.fc1 = nn.Linear(d_model, 2 * hidden, bias=False)
+        self.norm1 = RMSNorm(hidden)
         self.fc2 = nn.Linear(hidden, d_model, bias=False)
-        self.norm2 = RMSNorm()
+        self.norm2 = RMSNorm(d_model)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.norm2(self.fc2(self.norm1(F.relu(self.fc1(x)).square())))
+        y = self.fc1(x)
+        gate, value = y.chunk(2, dim=-1)
+        return self.norm2(self.fc2(self.norm1(F.silu(gate) * value)))
 
 
 class Mamba3BlockWrapper(nn.Module):
@@ -519,8 +527,8 @@ class Mamba3BlockWrapper(nn.Module):
             rope_fraction=rope_fraction, is_mimo=False,
             is_outproj_norm=False, layer_idx=layer_idx, n_layer=n_layer,
         )
-        self.ssm_postnorm = RMSNorm()
-        self.mlp_postnorm = RMSNorm()
+        self.ssm_postnorm = RMSNorm(d_model)
+        self.mlp_postnorm = RMSNorm(d_model)
         self.alpha = 2.0 * num_layers ** 0.25
         self.beta = 8.0 * num_layers ** -0.25
 
@@ -569,7 +577,7 @@ class MambaModel(nn.Module):
             for i in range(num_layers)
         ])
 
-        self.final_norm = RMSNorm()
+        self.final_norm = RMSNorm(d_model)
         self.lm_head = None if tie_embeddings else nn.Linear(d_model, vocab_size, bias=False)
         if self.lm_head is not None:
             nn.init.zeros_(self.lm_head.weight)
@@ -733,6 +741,7 @@ def main() -> None:
     # - SSM dynamics params (dt_bias, D, B_bias, C_bias) use SSM_LR via Adam
     # - other vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    shared_mlp_named_params = list(base_model.shared_mlp.named_parameters())
 
     ssm_param_patterns = ("dt_bias", ".D", "B_bias", "C_bias")
     matrix_params = [
@@ -741,6 +750,9 @@ def main() -> None:
         and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         and not any(pattern in name for pattern in ssm_param_patterns)
     ]
+    shared_mlp_fc1 = [p for name, p in shared_mlp_named_params if "fc1" in name and p.ndim == 2]
+    shared_mlp_fc2 = [p for name, p in shared_mlp_named_params if "fc2" in name and p.ndim == 2]
+    shared_mlp_scalar = [p for name, p in shared_mlp_named_params if p.ndim < 2]
     ssm_params = [
         p for name, p in block_named_params
         if any(pattern in name for pattern in ssm_param_patterns)
@@ -757,26 +769,38 @@ def main() -> None:
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
+        weight_decay=0.04,
     )
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=0.04,
     )
+    # Shared MLP is reused across all layers, so scale LR down by sqrt(num_layers)
+    shared_mlp_matrix_lr = args.matrix_lr / args.num_layers ** 0.5
+    optimizer_muon.add_param_group({"params": shared_mlp_fc1, "lr": shared_mlp_matrix_lr, "base_lr": shared_mlp_matrix_lr, "weight_decay": 0.08})
+    optimizer_muon.add_param_group({"params": shared_mlp_fc2, "lr": shared_mlp_matrix_lr, "base_lr": shared_mlp_matrix_lr, "weight_decay": 0.04})
     for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
+        group["base_lr"] = group.get("base_lr", args.matrix_lr)
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        [
+            {"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr},
+            {"params": shared_mlp_scalar, "lr": args.scalar_lr / args.num_layers ** 0.5, "base_lr": args.scalar_lr / args.num_layers ** 0.5},
+            {"params": [base_model.final_norm.weight], "lr": args.scalar_lr, "base_lr": args.scalar_lr},
+        ],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
+        weight_decay=0.04,
     )
     optimizer_ssm = torch.optim.Adam(
         [{"params": ssm_params, "lr": args.ssm_lr, "base_lr": args.ssm_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
+        weight_decay=0.04,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_ssm]
     if base_model.lm_head is not None:
